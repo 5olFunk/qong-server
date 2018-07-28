@@ -1,0 +1,15 @@
+name:       qong-server
+version:    0.1.0.0
+synopsis:   Web server to support two-player functionality of qong
+author:     IanTucker
+maintainer: tucker.ian@gmail.com
+category:   Game
+build-type: Simple
+extra-source-files: README.md
+cabal-version: >=1.10
+
+executable qong-server
+  main-is:  Main.hs
+  build-depends:  base, text, websockets, aeson, transformers, uuid
+  hs-source-dirs: src
+  default-language: Haskell2010
