@@ -12,116 +12,19 @@ module Main where
 
 import Data.Aeson
 import Data.Text (Text)
+import Data.Time.Clock.POSIX
 import Control.Concurrent
 import Control.Concurrent.STM.TQueue
 import Control.Monad (forever, when, forM_)
 import Control.Monad.IO.Class
 import GHC.Generics
-
+import Models
+import Game
 import qualified Network.WebSockets as WS
 
-data ServerState = ServerState 
-  { clients :: [Client] 
-  , gameSeeds :: [MVar GameSeed]
-  , games :: [(Text, MVar GameState)]
-  }
-
-data GameSeed = GameSeed
-  { name :: Text
-  , clients :: [Client] 
-  }
-
-data GameState = GameState
-  { name :: Text
-  , running :: Bool
-  , players :: [Player]
-  , queue :: Chan Message
-  }
-
-data Client = Client
-  { name :: Text
-  , connection :: WS.Connection
-  }
-
-data Player = Player
-  { name :: Text
-  , connection :: WS.Connection
-  , score :: Int
-  , position :: Int
-  }
-
-instance Show Player where
-  show Player{..} = show name ++ "," ++ show score ++ "," ++ show position
-
-instance ToJSON Player where
-  toJSON Player{..} = object [
-    "name" .= name,
-    "score" .= score,
-    "position" .= position ]
-
-data Message 
-  = NewClientReqMsg   { name :: Text }
-  | NewClientResMsg   { newClientResult :: NewClientResult }
-  | ListGamesReqMsg   { }
-  | ListGamesResMsg   { gameNames :: [Text] }
-  | NewGameReqMsg     { gameName :: Text }
-  | NewGameResMsg     { newGameResult :: NewGameResult }
-  | JoinGameReqMsg    { gameName :: Text }
-  | JoinGameResMsg    { joinGameResult :: JoinGameResult }
-  | StartGameReqMsg   { }
-  | GameStateMsg      { running :: Bool
-                      , players :: [Player] }
-  | MoveMsg           { playerName :: Text
-                      , direction :: Direction }
-  | NotImplementedMsg { }
-  deriving (Show, Generic)
-
-instance FromJSON Message where
-  parseJSON = withObject "message" $ \o -> do 
-    kind <- o .: "messageType"
-    case kind of
-      "NewClientReqMsg" -> NewClientReqMsg <$> o .: "name"
-      "ListGamesReqMsg" -> return (ListGamesReqMsg)
-      "JoinGameReqMsg"  -> JoinGameReqMsg <$> o .: "gameName"
-      "NewGameReqMsg"   -> NewGameReqMsg <$> o .: "gameName" 
-      "StartGameReqMsg" -> return (StartGameReqMsg)
-      "MoveMsg"         -> MoveMsg <$> o .: "name" <*> o .: "direction"
-      _ -> fail ("unknown message type: " ++ kind)
-
-instance ToJSON Message where
-  toJSON NewClientResMsg{..} = object [
-    "messageType" .= ("NewClientResMsg" :: Text),
-    "result"      .= newClientResult ]
-  toJSON ListGamesResMsg{..} = object [
-    "messageType" .= ("ListGamesResMsg" :: Text),
-    "gameNames"   .= gameNames ]
-  toJSON NotImplementedMsg = object [
-    "messageType" .= ("NotImplementedMsg" :: Text) ]
-  toJSON JoinGameResMsg{..} = object [
-    "messageType" .= ("JoinGameResMsg" :: Text),
-    "result"      .= joinGameResult ]
-  toJSON GameStateMsg{..} = object [
-    "messageType" .= ("GameStateMsg" :: Text),
-    "running"     .= running,
-    "players"     .= players ]
-
-data NewClientResult = CreatedNewClient | ClientExistsFailure deriving(Show, Generic)
-instance ToJSON NewClientResult
-
-data JoinGameResult = JoinedGame | FailedToJoinGame deriving(Show, Generic)
-instance ToJSON JoinGameResult
-
-data NewGameResult = CreatedNewGame | FailedToCreateNewGame deriving(Show, Generic)
-instance ToJSON NewGameResult
-
-data Direction = Clockwise | CounterClockwise deriving(Show, Generic)
-instance FromJSON Direction
 
 newServerState :: ServerState
 newServerState = ServerState [] [] []
-
-toMessage :: GameState -> Message
-toMessage s = GameStateMsg (running (s::GameState)) $ players (s::GameState)
 
 makePlayer :: Client -> Player
 makePlayer Client{..} = Player name connection 0 0
@@ -183,6 +86,7 @@ listenInClientContext serverState client@Client{..} =
       _ -> return ()
   where
     reply = \m -> WS.sendTextData connection $ encode m
+
     handleNewGameReq (NewGameReqMsg gameName) = do
       state <- readMVar serverState
       --if ((games state) `containsGameName` gameName)
@@ -190,11 +94,14 @@ listenInClientContext serverState client@Client{..} =
       --  putStrLn $ "Failed to create game: " ++ (show gameName)
       --  reply $ NewGameResMsg FailedToCreateNewGame
       --else do
-      putStrLn $ "Making new game: " ++ show gameName
+      reply $ NewGameResMsg CreatedNewGame
+      --putStrLn $ "Making new game: " ++ show gameName
       newGame gameName serverState
       addPlayer gameName serverState $ makePlayer client
+      
     handleJoinGameReq (JoinGameReqMsg gameName) = do
       state <- readMVar serverState
+      reply $ JoinGameResMsg JoinedGame
       putStrLn $ "Client " ++ show name ++ " is joining game " ++ show gameName
       addPlayer gameName serverState $ makePlayer client
 
@@ -207,9 +114,11 @@ addPlayer gameName state p@Player{..} = do
   case maybeGame of
     Nothing -> return ()
     Just (gameName, game) -> do
-      liftIO $ modifyMVar_ game $ \g@GameState{..} -> do
-        return $ (g::GameState) {players = p:players}
+      g <- readMVar game
+      let msgQ = queue g
+      writeChan msgQ $ NewPlayerMsg gameName p
       listenInGameContext game p
+
   
 first :: (a -> Bool) -> [a] -> Maybe a
 first f []     = Nothing
@@ -218,8 +127,9 @@ first f (x:xs) = if f x then Just x else first f xs
 newGame :: Text -> MVar ServerState -> IO ()
 newGame gameName serverState = do
   msgQ <- newChan
-  game <- newMVar $ GameState gameName False [] msgQ
-  forkIO $ gameMsgHandler msgQ game
+  time <- getPOSIXTime
+  game <- newMVar $ GameState gameName False [] msgQ time
+  forkIO $ startLoopGame game broadcastGameState
   liftIO $ modifyMVar_ serverState $ \s -> do
     return $ (s::ServerState) {games=(gameName, game):(games s)}
   
@@ -236,50 +146,18 @@ listenInGameContext state Player{..} = do
 send :: WS.Connection -> Message -> IO ()
 send conn msg = WS.sendTextData conn $ encode msg
 
-broadcastGameState :: MVar GameState -> IO ()
-broadcastGameState state = do
-  gameState <- readMVar state
+broadcastGameState :: GameState -> IO ()
+broadcastGameState gameState = 
   let msg = toMessage gameState
-  let ps = players (gameState::GameState)
-  forM_ ps $ \p@Player{..} -> send connection msg
+      ps = players (gameState::GameState)
+  in do
+    forM_ ps $ \p@Player{..} -> send connection msg
+    putStrLn $ "broadcasted..." ++ (show $ encode msg)
 
 broadcast :: Message -> [Client] -> IO ()
-broadcast msg clients = forM_ clients $ \Client{..} -> send connection msg
-
---spawnNewGameEngine :: MVar GameSeed -> IO ThreadId
---spawnNewGameEngine g = do
---  game <- readMVar g
---  msgQ <- newChan
---  let players = map makePlayer $ clients (game::GameSeed)
---  gameState <- newMVar $ GameState False players
---  forkIO $ gameMsgHandler msgQ gameState
-
-gameMsgHandler :: Chan Message -> MVar GameState -> IO ()
-gameMsgHandler chan gameState = 
-  forever $ do
-    msg <- readChan chan
-    case msg of
-      StartGameReqMsg -> do
-        putStrLn $ "Game has been started..."
-        liftIO $ modifyMVar_ gameState $ \s -> do
-          return $ (s :: GameState) {running=True}
-        broadcastGameState gameState
-      move@MoveMsg{..} -> do
-        putStrLn $ "player " ++ show playerName ++ " moved " ++ show direction
-        liftIO $ modifyMVar_ gameState $ \s -> do
-          return $ movePlayer s move
-        broadcastGameState gameState
-      _ -> putStrLn $ "Woah there! whats this message?? " ++ show msg
-  where movePlayer s move = 
-          (s::GameState){players = map 
-                           (\p@Player{..} -> 
-                             if name == playerName move 
-                             then p{position=(moveDirection position (direction move))}
-                             else p) 
-                           (players (s::GameState))}
-        moveDirection x d = case d of 
-          Clockwise -> x-1
-          CounterClockwise -> x+1
+broadcast msg clients = do
+  putStrLn $ "broadcast sending: " ++ show msg
+  forM_ clients $ \Client{..} -> send connection msg
 
 application :: MVar ServerState -> WS.PendingConnection -> IO ()
 application state pending = do 
