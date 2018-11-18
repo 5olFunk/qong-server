@@ -34,7 +34,9 @@ data GameState = GameState
   { name :: Text
   , running :: Bool
   , players :: [Player]
-  , queue :: Chan Message
+  , puckPos :: Vec3
+  , puckVel :: Vec3
+  , queue :: TQueue Message
   , time :: NominalDiffTime
   }
 
@@ -72,14 +74,29 @@ data Message
   | JoinGameResMsg    { joinGameResult :: JoinGameResult }
   | StartGameReqMsg   { }
   | GameStateMsg      { running :: Bool
-                      , players :: [Player] }
+                      , players :: [Player] 
+                      , puckPos :: Vec3
+                      , puckVel :: Vec3
+                      }
   | MoveMsg           { playerName :: Text
                       , direction :: Direction }
   | NotImplementedMsg { }
   deriving (Show, Generic)
 
+data Vec3
+  = Vec3
+  { x :: Float
+  , y :: Float 
+  , z :: Float
+  } deriving (Show, Generic)
+
+addVec3 :: Vec3 -> Vec3 -> Vec3
+addVec3 (Vec3 ax ay az) (Vec3 bx by bz) =
+  Vec3 (ax + bx) (ay + by) (az + bz)
+
 toMessage :: GameState -> Message
-toMessage s = GameStateMsg (running (s::GameState)) $ players (s::GameState)
+toMessage (GameState _ running players puckPos puckVel _ _) = 
+  GameStateMsg running players puckPos puckVel
 
 instance FromJSON Message where
   parseJSON = withObject "message" $ \o -> do 
@@ -115,7 +132,18 @@ instance ToJSON Message where
   toJSON GameStateMsg{..} = object [
     "messageType" .= ("GameStateMsg" :: Text),
     "running"     .= running,
-    "players"     .= players ]
+    "players"     .= players,
+    "puckPos"     .= object [
+                       "x" .= x puckPos,
+                       "y" .= y puckPos,
+                       "z" .= z puckPos
+                     ],
+    "puckVel"     .= object [
+                       "x" .= x puckVel,
+                       "y" .= y puckVel,
+                       "z" .= z puckVel
+                     ]
+     ]
   toJSON msg = object [ "msg" .= ("Error, can't serialize object" :: Text) ]
 
 data NewClientResult = CreatedNewClient | ClientExistsFailure deriving(Show, Generic)

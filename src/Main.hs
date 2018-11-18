@@ -11,10 +11,11 @@
 module Main where
 
 import Data.Aeson
+import Data.Aeson.Encode.Pretty
 import Data.Text (Text)
 import Data.Time.Clock.POSIX
 import Control.Concurrent
-import Control.Concurrent.STM.TQueue
+import Control.Concurrent.STM
 import Control.Monad (forever, when, forM_)
 import Control.Monad.IO.Class
 import GHC.Generics
@@ -56,7 +57,7 @@ listenInInitialContext serverState conn =
       Just msg@NewClientReqMsg{..} -> handleRequest msg 
       _ -> putStrLn $ "InitialContext received strange message: " ++ show jsonMsg
   where 
-    reply = \m ->  WS.sendTextData conn $ encode m
+    reply = \m ->  WS.sendTextData conn $ encodePretty m
     handleRequest m = do
       state <- readMVar serverState
       let allClients = clients (state :: ServerState)
@@ -85,7 +86,7 @@ listenInClientContext serverState client@Client{..} =
       Just msg@JoinGameReqMsg{..} -> handleJoinGameReq msg
       _ -> return ()
   where
-    reply = \m -> WS.sendTextData connection $ encode m
+    reply = \m -> WS.sendTextData connection $ encodePretty m
 
     handleNewGameReq (NewGameReqMsg gameName) = do
       state <- readMVar serverState
@@ -116,7 +117,7 @@ addPlayer gameName state p@Player{..} = do
     Just (gameName, game) -> do
       g <- readMVar game
       let msgQ = queue g
-      writeChan msgQ $ NewPlayerMsg gameName p
+      atomically $ writeTQueue msgQ $ NewPlayerMsg gameName p
       listenInGameContext game p
 
   
@@ -126,10 +127,17 @@ first f (x:xs) = if f x then Just x else first f xs
 
 newGame :: Text -> MVar ServerState -> IO ()
 newGame gameName serverState = do
-  msgQ <- newChan
+  msgQ <- atomically $ newTQueue
   time <- getPOSIXTime
-  game <- newMVar $ GameState gameName False [] msgQ time
-  forkIO $ startLoopGame game broadcastGameState
+  game <- newMVar $ GameState 
+                      gameName 
+                      False 
+                      [] 
+                      (Vec3 0 0 0)
+                      (Vec3 0 0 0)
+                      msgQ 
+                      time
+  forkIO $ startGameTicker game broadcastGameState
   liftIO $ modifyMVar_ serverState $ \s -> do
     return $ (s::ServerState) {games=(gameName, game):(games s)}
   
@@ -140,11 +148,11 @@ listenInGameContext state Player{..} = do
   forever $ do 
     jsonMsg <- WS.receiveData connection
     case decode jsonMsg :: Maybe Message of
-      Just msg -> writeChan msgQ msg
+      Just msg -> atomically $ writeTQueue msgQ msg
       Nothing  -> return ()
 
 send :: WS.Connection -> Message -> IO ()
-send conn msg = WS.sendTextData conn $ encode msg
+send conn msg = WS.sendTextData conn $ encodePretty msg
 
 broadcastGameState :: GameState -> IO ()
 broadcastGameState gameState = 
@@ -152,13 +160,13 @@ broadcastGameState gameState =
       ps = players (gameState::GameState)
   in do
     forM_ ps $ \p@Player{..} -> send connection msg
-    putStrLn $ "broadcasted..." ++ (show $ encode msg)
+    --putStrLn $ "broadcasted: " ++ (show $ encode msg)
 
 broadcast :: Message -> [Client] -> IO ()
 broadcast msg clients = do
   putStrLn $ "broadcast sending: " ++ show msg
   forM_ clients $ \Client{..} -> send connection msg
-
+  
 application :: MVar ServerState -> WS.PendingConnection -> IO ()
 application state pending = do 
   conn <- WS.acceptRequest pending
